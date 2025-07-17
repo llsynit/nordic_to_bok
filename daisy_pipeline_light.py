@@ -7,11 +7,16 @@ import tempfile
 import logging
 import requests
 import datetime
+import urllib
 import base64
 import random
 import hmac
 import hashlib
 from lxml import etree as ET
+from lxml.etree import XPath
+from lxml.etree import XPathEvaluator
+
+
 from fastapi import FastAPI, UploadFile, File, Form
 from fastapi.responses import JSONResponse
 from typing import Optional
@@ -101,18 +106,21 @@ class RemoteDaisyPipelineJob:
     def _select_engine(self):
         logger.info("Available engines: " + str(self.engines))
         for pipeline_version, script_version in self.versions:
-            logger.info(
-                f"Trying version: {pipeline_version}, {script_version}")
-
             for engine in self.engines:
-                # if self._script_available(engine, version):
-                if self.script_available(engine, pipeline_version, script_version):
+
+                logger.info(
+                    f"Trying endpoint: {engine['endpoint']} looking for pipeline version {pipeline_version}, script: {script_version}")
+                if self._script_available(engine, pipeline_version, script_version):
+                    # if self.script_available(engine, pipeline_version, script_version):
                     self.engine = engine
-                    self.found_pipeline_version, self.found_script_version = version
+                    # self.found_pipeline_version, self.found_script_version = version
+                    self.found_pipeline_version = pipeline_version
+                    self.found_script_version = script_version
                     return True
         return False
 
-    def _script_available(self, engine, version):
+    def _script_available(self, engine, pipeline_version, script_version):
+        scripts = None
         try:
             alive = requests.get(self._url(engine, "/alive"))
             if not alive.ok:
@@ -121,95 +129,52 @@ class RemoteDaisyPipelineJob:
                 return False
             version_str = ET.XML(alive.content.split(
                 b"?>")[-1]).attrib.get("version")
-            if version_str != version[0]:
+            if version_str != pipeline_version:
                 logger.warning(
-                    f"Engine {engine['endpoint']} version mismatch: expected {version[0]}, got {version_str}")
+                    f"Engine {engine['endpoint']} version mismatch: expected {pipeline_version}, got {version_str}")
                 return False
             logger.info(
                 f"Engine {engine['endpoint']} is alive and version matches: {version_str}")
-            scripts = requests.get(self._url(engine, "/scripts"))
-            root = ET.XML(scripts.content.split(b"?>")[-1])
-            script_el = root.xpath(
-                f"/d:scripts/d:script[@id='{self.script_id}']",
-                namespaces=self.namespace
-            )
-            if not script_el:
+            try:
+                scripts = requests.get(self.encode_url(engine, "/scripts", {}))
+                """root = ET.XML(scripts.content.split(b"?>")[-1])
+                    engine_script = root.xpath(
+                        f"/d:scripts/d:script[@id='{self.script_id}']",
+                        namespaces=self.namespace
+                    )"""
+                if scripts.ok:
+                    scripts = str(scripts.content, 'utf-8')
+                    scripts = ET.XML(scripts.split("?>")[-1])
+                else:
+                    scripts = None
+            except Exception as e:
+                scripts = None
+                logger.warning(
+                    f"Failed to fetch scripts from {engine['endpoint']}: {e}")
                 return False
-            script_ver = script_el[0].find(
-                "d:version", namespaces=self.namespace).text
-            return script_ver == version[1]
+            # script_ver = script_el[0].find("d:version", namespaces=self.namespace).text
+            # script_ver = engine_script[0].find("d:version", namespaces=self.namespace).text
+            print(f"Scripts******@: {scripts}")
+            print(f"Script ID----->: {self.script_id}")
+            print(f"Version ID----->: {self.versions}")
+            engine_script = scripts.xpath("/d:scripts/d:script[@id='{}']".format(
+                self.script_id), namespaces=self.namespace)
+            if engine_script is not None and len(engine_script) > 0:
+                engine_script_version = engine_script[0]
+            else:
+                engine_script_version = None
+            # test if script version is correct
+            if script_version is not None and (engine_script_version is None or script_version != engine_script_version.text):
+                logger.debug("Incorrect version of Pipeline 2. Looking for {} but found {}.".format(
+                    script_version, engine_script_version))
+
+            return engine_script_version
         except Exception as e:
             logger.warning(f"Script availability check failed: {e}")
             return False
 
-    def script_available(self, engine, pipeline_version, script_version):
-        alive = None
-        scripts = None
-
-        try:
-            alive = requests.get(self._url(engine, "/alive", {}))
-            if alive.ok:
-                alive = str(alive.content, 'utf-8')
-                alive = ET.XML(alive.split("?>")[-1])
-            else:
-                alive = None
-        except Exception:
-            alive = None
-
-        if alive is None:
-            logger.warning(
-                "Pipeline 2 kjører ikke på: {}".format(engine["endpoint"]))
-            return False
-
-        # find engine version
-        engine_pipeline_version = alive.attrib.get("version")
-
-        # test for correct engine version
-        if pipeline_version is not None and pipeline_version != engine_pipeline_version:
-            logger.debug("Incorrect version of Pipeline 2. Looking for {} but found {}.".format(pipeline_version,
-                                                                                                engine_pipeline_version))
-            return False
-
-        try:
-            scripts = requests.get(self._url(engine, "/scripts", {}))
-            if scripts.ok:
-                scripts = str(scripts.content, 'utf-8')
-                scripts = ET.XML(scripts.split("?>")[-1])
-            else:
-                scripts = None
-        except Exception:
-            scripts = None
-
-        if scripts is None:
-            logger.warning("Klarte ikke å hente liste over skript fra Pipeline 2 på: {}".format(
-                engine["endpoint"]))
-            return False
-
-        # find script
-        engine_script = scripts.xpath(
-            "/d:scripts/d:script[@id='{}']".format(self.script), namespaces=self.namespace)
-        engine_script = engine_script[0] if len(engine_script) else None
-
-        # test if script was found
-        if engine_script is None:
-            logger.debug("Script not found: {}".format(self.script))
-            return False
-
-        # find script version
-        engine_script_version = engine_script.xpath(
-            "d:version", namespaces=self.namespace) if len(engine_script) else None
-        engine_script_version = engine_script_version[0].text if len(
-            engine_script_version) else None
-
-        # test if script version is correct
-        if script_version is not None and script_version != engine_script_version:
-            logger.debug("Incorrect version of Pipeline 2. Looking for {} but found {}.".format(script_version,
-                                                                                                engine_script_version))
-            return False
-
-        return True
-
     def _post_job(self):
+        logger.info("Posting job to remote Daisy Pipeline...")
         script_url = self._url(self.engine, f"/scripts/{self.script_id}")
         script_xml = ET.XML(requests.get(script_url).content.split(b"?>")[-1])
 
@@ -218,27 +183,40 @@ class RemoteDaisyPipelineJob:
         job_req.append(ET.XML(f"<priority>medium</priority>"))
         job_req.append(ET.XML(f"<script href='{script_url}'/>"))
 
-        for input_ in script_xml.xpath("/d:script/d:input", namespaces=self.namespace):
-            name = input_.attrib["name"]
-            if name in self.arguments:
-                values = self.arguments[name]
-                if not isinstance(values, list):
-                    values = [values]
-                input_el = ET.Element("input", name=name)
-                for val in values:
-                    input_el.append(ET.Element("item", value=val))
-                job_req.append(input_el)
+        for input in script_xml.xpath("/d:script/d:input", namespaces=self.namespace):
+            if input.attrib["name"] in self.arguments:
+                values = []
+                argument = self.arguments[input.attrib["name"]]
+                if not isinstance(argument, list):
+                    argument = [argument]
+                for argument_value in argument:
+                    value = argument_value
+                    values.append(value)
 
-        for opt in script_xml.xpath("/d:script/d:option", namespaces=self.namespace):
-            name = opt.attrib["name"]
-            if name in self.arguments:
-                values = self.arguments[name]
-                if not isinstance(values, list):
-                    values = [values]
-                option_el = ET.Element("option", name=name)
-                for val in values:
-                    option_el.append(ET.Element("item", value=val))
-                job_req.append(option_el)
+                input_xml = f'<input name="{input.attrib["name"]}" xmlns="http://www.daisy.org/ns/pipeline/data">'
+                for value in values:
+                    input_xml += f'<item value="{value}"/>'
+                input_xml += "</input>"
+                job_req.append(ET.XML(input_xml))
+
+        for option in script_xml.xpath("/d:script/d:option", namespaces=self.namespace):
+            if option.attrib["name"] in self.arguments:
+                values = []
+                argument = self.arguments[option.attrib["name"]]
+                if not isinstance(argument, list):
+                    argument = [argument]
+                for argument_value in argument:
+                    value = argument_value
+                    values.append(value)
+
+                option_xml = f'<option name="{option.attrib["name"]}" xmlns="http://www.daisy.org/ns/pipeline/data">'
+                if len(values) == 1:
+                    option_xml += values[0]
+                else:
+                    for value in values:
+                        option_xml += f'<item value="{value}"/>'
+                option_xml += "</option>"
+                job_req.append(ET.XML(option_xml))
 
         job_xml_path = tempfile.mktemp(suffix=".xml")
         ET.ElementTree(job_req).write(
@@ -339,3 +317,33 @@ class RemoteDaisyPipelineJob:
             # base += f"&sign={sig}"  # Uncomment if required by server
 
         return base
+
+    def encode_url(self, engine, endpoint, parameters):
+        if engine["authentication"] == "true":
+            iso8601 = datetime.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
+            nonce = str(random.randint(10**29, 10**30-1))  # 30 digits
+
+            parameters["authid"] = engine["key"]
+            parameters["time"] = iso8601
+            parameters["nonce"] = nonce
+
+        url = engine["endpoint"] + endpoint
+        if parameters:
+            url += "?" + urllib.parse.urlencode(parameters)
+
+        if engine["authentication"] == "true":
+            # Use RFC 2104 HMAC for keyed hashing of the URL
+            hash = hmac.new(engine["secret"].encode('utf-8'),
+                            url.encode('utf-8'),
+                            digestmod=hashlib.sha1)
+
+            # Use base 64 encoding
+            hash = base64.b64encode(hash.digest()).decode('utf-8')
+
+            # Base64 encoding uses + which we have to encode in URL parameters.
+            hash = hash.replace("+", "%2B")
+
+            # Append hash as parameter to the end of the URL
+            url += "&sign=" + hash
+
+        return url
